@@ -5,10 +5,13 @@ services:
       - "8000:8000"
     environment:
       QC_DB: /data/qc.db
+      QC_ARCHIVE_DIR: /archive
       QC_SECRET: change-me-in-production
     volumes:
       - qc-data:/data
+      - qc-archive:/archive
     restart: unless-stopped
 
 volumes:
   qc-data:
+  qc-archive:

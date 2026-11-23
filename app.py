@@ -6,9 +6,11 @@ Docker:        docker compose up --build
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,11 +41,21 @@ def default_db_path() -> str:
     return str(BASE_DIR / "data" / "qc.db")
 
 
+def default_archive_dir() -> str:
+    explicit = os.environ.get("QC_ARCHIVE_DIR")
+    if explicit:
+        return explicit
+    if Path("/archive").is_dir() and os.access("/archive", os.W_OK):
+        return "/archive"
+    return str(BASE_DIR / "data" / "archive")
+
+
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.environ.get("QC_SECRET", "coil-p95-dev-secret"),
     MAX_CONTENT_LENGTH=16 * 1024 * 1024,
     DATABASE=default_db_path(),
+    ARCHIVE_DIR=default_archive_dir(),
 )
 
 
@@ -84,12 +96,16 @@ CREATE INDEX IF NOT EXISTS idx_summaries_coil ON summaries(coil_id, active);
 CREATE TABLE IF NOT EXISTS details (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     coil_id         INTEGER NOT NULL REFERENCES coils(id) ON DELETE CASCADE,
-    readings        TEXT NOT NULL,          -- JSON array of integers
+    readings        TEXT NOT NULL,          -- JSON array of integers; '' once archived
     point_count     INTEGER NOT NULL,
     min_um          INTEGER NOT NULL,
     p95_um          INTEGER NOT NULL,
     max_um          INTEGER NOT NULL,
     active          INTEGER NOT NULL DEFAULT 1,
+    archived        INTEGER NOT NULL DEFAULT 0,
+    readings_sha256 TEXT,                   -- fingerprint kept after readings are cleared
+    archived_at     TEXT,
+    state_version   INTEGER NOT NULL DEFAULT 0,  -- bumped on every enable/retire/archive
     retired_reason  TEXT,
     retired_at      TEXT,
     created_at      TEXT NOT NULL
@@ -143,8 +159,27 @@ def ensure_schema() -> None:
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(SCHEMA)
+        migrate_details(conn)
     finally:
         conn.close()
+
+
+def migrate_details(conn: sqlite3.Connection) -> None:
+    """Add archive columns to databases created before archiving existed."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(details)")}
+    additions = {
+        "archived":
+            "ALTER TABLE details ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        "readings_sha256":
+            "ALTER TABLE details ADD COLUMN readings_sha256 TEXT",
+        "archived_at":
+            "ALTER TABLE details ADD COLUMN archived_at TEXT",
+        "state_version":
+            "ALTER TABLE details ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, ddl in additions.items():
+        if name not in cols:
+            conn.execute(ddl)
 
 
 def init_db() -> None:
@@ -363,8 +398,8 @@ def ensure_coil(conn, batch_id: int, coil_no: str):
 
 def retire_detail(conn, detail_id: int, reason: str) -> None:
     conn.execute(
-        "UPDATE details SET active = 0, retired_reason = ?, retired_at = ? "
-        "WHERE id = ? AND active = 1",
+        "UPDATE details SET active = 0, retired_reason = ?, retired_at = ?, "
+        "state_version = state_version + 1 WHERE id = ? AND active = 1",
         (reason, utcnow(), detail_id),
     )
 
@@ -531,6 +566,176 @@ def fetch_coil_views(conn, batch_id: int):
             }
         )
     return views
+
+
+# ---------------------------------------------------------------------------
+# Archive disk
+#
+# A retired detail's complete readings can be offloaded to the archive disk
+# (QC_ARCHIVE_DIR, a separately mounted persistent volume).  The archive file
+# keeps the original detail number, point count and the three statistics, and
+# stores the readings in their original order.  Registration and the clearing
+# of the library readings happen in one transaction, only after the on-disk
+# copy has been verified to match the library exactly (values and order).
+# ---------------------------------------------------------------------------
+
+class ArchiveConflict(Exception):
+    """The detail was enabled or altered while its archive file was written."""
+
+
+def archive_file_path(archive_dir, detail_id: int) -> Path:
+    return Path(archive_dir) / f"detail-{detail_id}.json"
+
+
+def readings_fingerprint(readings) -> str:
+    """Fingerprint over both the values and the order of the readings."""
+    canon = json.dumps([int(v) for v in readings], separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _sync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_archive_file(archive_dir, detail_id: int, payload: dict) -> Path:
+    """Write the archive file atomically.
+
+    The final name is deterministic per detail, so a retry after a failure or
+    an interruption converges on the same single official file instead of
+    piling up duplicates.  Half-written temp files are cleaned up here and by
+    :func:`sweep_archive_tmp` at startup.
+    """
+    directory = Path(archive_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    final = archive_file_path(directory, detail_id)
+    tmp = directory / f".detail-{detail_id}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+    data = json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8")
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, final)
+        _sync_dir(directory)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            app.logger.warning("archive temp cleanup failed: %s", tmp, exc_info=True)
+    return final
+
+
+def load_archive_file(archive_dir, detail_id: int) -> dict:
+    path = archive_file_path(archive_dir, detail_id)
+    with open(path, "rb") as fh:
+        return json.loads(fh.read().decode("utf-8"))
+
+
+def sweep_archive_tmp() -> None:
+    """Remove half-written temp files left by an interrupted archive run."""
+    try:
+        directory = Path(app.config["ARCHIVE_DIR"])
+        if not directory.is_dir():
+            return
+        for tmp in directory.glob(".detail-*.tmp-*"):
+            try:
+                tmp.unlink()
+            except OSError:
+                app.logger.warning("cannot remove stale temp archive %s", tmp)
+    except OSError:
+        app.logger.warning("archive directory sweep failed", exc_info=True)
+
+
+def register_detail_archive(conn, detail_id: int, expected_version: int,
+                            archive_dir) -> bool:
+    """Register the archive and clear the library readings, atomically.
+
+    Returns True when this call registered the archive, False when a
+    concurrent run had already registered it.  Raises :class:`ArchiveConflict`
+    when the detail was enabled (even briefly) or otherwise changed since
+    ``expected_version`` was read — in that case the library readings must be
+    kept.  The on-disk readings are re-verified against the library inside the
+    transaction; only an exact match (values and order) allows the clearing.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT * FROM details WHERE id = ?", (detail_id,)
+        ).fetchone()
+        if row is None:
+            raise InputError("明细不存在")
+        if row["archived"]:
+            conn.execute("COMMIT")
+            return False
+        if row["active"] or row["state_version"] != expected_version:
+            raise ArchiveConflict(detail_id)
+        db_readings = [int(v) for v in json.loads(row["readings"])]
+        try:
+            payload = load_archive_file(archive_dir, detail_id)
+        except (OSError, ValueError) as exc:
+            raise InputError("档案盘回读失败，未登记转存，库内读数保持不变") from exc
+        if payload.get("readings") != db_readings:
+            raise InputError("档案盘读数与库内不一致，未登记转存，库内读数保持不变")
+        sha = readings_fingerprint(db_readings)
+        stored_sha = payload.get("readings_sha256")
+        if stored_sha is not None and stored_sha != sha:
+            raise InputError("档案指纹与库内读数不符，未登记转存，库内读数保持不变")
+        conn.execute(
+            "UPDATE details SET archived = 1, readings = '', readings_sha256 = ?, "
+            "archived_at = ?, state_version = state_version + 1 WHERE id = ?",
+            (sha, utcnow(), detail_id),
+        )
+        conn.execute("COMMIT")
+        return True
+    except Exception:
+        rollback_quiet(conn)
+        raise
+
+
+def restore_archived_readings(row, archive_dir) -> list[int]:
+    """Load archived readings and verify them against the retained fingerprint.
+
+    Any missing archive, unreadable file, wrong detail number or fingerprint
+    mismatch raises :class:`InputError`; the caller keeps the detail retired.
+    """
+    detail_id = row["id"]
+    try:
+        payload = load_archive_file(archive_dir, detail_id)
+    except FileNotFoundError:
+        raise InputError(
+            f"档案盘缺档（detail-{detail_id}.json），明细保持停用；历史判定照常查阅"
+        ) from None
+    except (OSError, ValueError):
+        raise InputError("档案文件无法读取，明细保持停用；历史判定照常查阅") from None
+    if payload.get("detail_id") != detail_id:
+        raise InputError("档案文件与明细号不符，明细保持停用")
+    readings = payload.get("readings")
+    if (
+        not isinstance(readings, list)
+        or not readings
+        or any(type(v) is not int for v in readings)
+    ):
+        raise InputError("档案读数格式无效，明细保持停用")
+    if readings_fingerprint(readings) != (row["readings_sha256"] or ""):
+        raise InputError("档案读数或顺序与留存指纹不符，明细保持停用")
+    stats = (
+        payload.get("point_count"),
+        payload.get("min_um"),
+        payload.get("p95_um"),
+        payload.get("max_um"),
+    )
+    if stats != (row["point_count"], row["min_um"], row["p95_um"], row["max_um"]):
+        raise InputError("档案统计与库内留存不符，明细保持停用")
+    return [int(v) for v in readings]
 
 
 # ---------------------------------------------------------------------------
@@ -806,10 +1011,88 @@ def retire_detail_route(batch_id: int, detail_id: int):
     return redirect(url_for("batch_detail", batch_id=batch_id))
 
 
+@app.post("/batch/<int:batch_id>/detail/<int:detail_id>/archive")
+def archive_detail_route(batch_id: int, detail_id: int):
+    """Offload a retired detail's readings to the archive disk.
+
+    The file is written outside any database transaction, so the usual
+    activate entry stays usable while the write is in flight; the final
+    registration transaction refuses to clear the library readings if the
+    detail was enabled at any point during the write.
+    """
+    conn = get_db()
+    fetch_batch(conn, batch_id)
+    row = conn.execute(
+        "SELECT d.*, c.coil_no, b.batch_no FROM details d "
+        "JOIN coils c ON c.id = d.coil_id JOIN batches b ON b.id = c.batch_id "
+        "WHERE d.id = ? AND c.batch_id = ?",
+        (detail_id, batch_id),
+    ).fetchone()
+    if row is None:
+        raise InputError("明细不存在")
+    if row["archived"]:
+        flash(
+            f"明细 #{detail_id} 已在档案盘上（{row['archived_at'] or '此前'} 登记），"
+            "无需重复转存",
+            "ok",
+        )
+        return redirect(url_for("batch_detail", batch_id=batch_id))
+    if row["active"]:
+        raise InputError("明细正在使用，请先停用再转存到档案盘")
+
+    readings = [int(v) for v in json.loads(row["readings"])]
+    sha = readings_fingerprint(readings)
+    archive_dir = app.config["ARCHIVE_DIR"]
+    payload = {
+        "detail_id": row["id"],
+        "batch_id": batch_id,
+        "batch_no": row["batch_no"],
+        "coil_id": row["coil_id"],
+        "coil_no": row["coil_no"],
+        "point_count": row["point_count"],
+        "min_um": row["min_um"],
+        "p95_um": row["p95_um"],
+        "max_um": row["max_um"],
+        "readings": readings,
+        "readings_sha256": sha,
+        "archived_at": utcnow(),
+    }
+    try:
+        write_archive_file(archive_dir, detail_id, payload)
+    except OSError as exc:
+        app.logger.exception("archive write failed")
+        raise InputError(f"档案盘写入失败（{exc}），库内读数保持不变") from exc
+    try:
+        on_disk = load_archive_file(archive_dir, detail_id)
+    except (OSError, ValueError) as exc:
+        raise InputError("档案盘回读校验失败，未登记转存，库内读数保持不变") from exc
+    if on_disk.get("readings") != readings or on_disk.get("readings_sha256") != sha:
+        raise InputError("档案盘读数与库内不一致，未登记转存，库内读数保持不变")
+    try:
+        registered = register_detail_archive(
+            conn, detail_id, row["state_version"], archive_dir
+        )
+    except ArchiveConflict:
+        raise InputError(
+            "转存期间该明细被启用过（即使随后又停用），本次不清除库内读数；"
+            "档案文件未登记，可重新转存"
+        ) from None
+    if registered:
+        flash(
+            f"明细 #{detail_id} 已转存档案盘并登记：detail-{detail_id}.json "
+            f"（{len(readings)} 个读数，指纹 {sha[:12]}…），库内读数已清除",
+            "ok",
+        )
+    else:
+        flash(f"明细 #{detail_id} 已在档案盘上，本次未重复登记", "ok")
+    return redirect(url_for("batch_detail", batch_id=batch_id))
+
+
 @app.post("/batch/<int:batch_id>/detail/<int:detail_id>/activate")
 def activate_detail_route(batch_id: int, detail_id: int):
     conn = get_db()
     conn.execute("BEGIN IMMEDIATE")
+    restored = False
     try:
         fetch_batch(conn, batch_id)
         row = conn.execute(
@@ -829,23 +1112,39 @@ def activate_detail_route(batch_id: int, detail_id: int):
             raise InputError(
                 f"该明细与当前摘要不符（{mismatch}），不能启用；可先作废摘要"
             )
-        readings = tuple(sorted(int(v) for v in json.loads(row["readings"])))
-        if (
-            not readings
-            or qc.readings_stats(readings)
-            != (row["point_count"], row["min_um"], row["p95_um"], row["max_um"])
-        ):
-            raise InputError("该明细档案不完整或统计与读数不符，不能启用")
-        conn.execute(
-            "UPDATE details SET active = 1, retired_reason = NULL, "
-            "retired_at = NULL WHERE id = ?",
-            (detail_id,),
-        )
+        if row["archived"]:
+            # Archived detail: restore the readings from the archive disk,
+            # but only when the retained fingerprint (values and order) and
+            # the current summary both check out.
+            readings = restore_archived_readings(row, app.config["ARCHIVE_DIR"])
+            conn.execute(
+                "UPDATE details SET readings = ?, archived = 0, active = 1, "
+                "retired_reason = NULL, retired_at = NULL, "
+                "state_version = state_version + 1 WHERE id = ?",
+                (json.dumps(readings), detail_id),
+            )
+            restored = True
+        else:
+            readings = tuple(sorted(int(v) for v in json.loads(row["readings"])))
+            if (
+                not readings
+                or qc.readings_stats(readings)
+                != (row["point_count"], row["min_um"], row["p95_um"], row["max_um"])
+            ):
+                raise InputError("该明细档案不完整或统计与读数不符，不能启用")
+            conn.execute(
+                "UPDATE details SET active = 1, retired_reason = NULL, "
+                "retired_at = NULL, state_version = state_version + 1 WHERE id = ?",
+                (detail_id,),
+            )
         conn.execute("COMMIT")
     except Exception:
         rollback_quiet(conn)
         raise
-    flash("明细已启用", "ok")
+    if restored:
+        flash("明细已按档案盘读数恢复并启用（指纹与当前摘要均核对通过）", "ok")
+    else:
+        flash("明细已启用", "ok")
     return redirect(url_for("batch_detail", batch_id=batch_id))
 
 
@@ -979,6 +1278,8 @@ def format_um(value):
 
 if __name__ == "__main__":
     ensure_schema()
+    sweep_archive_tmp()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=False)
 else:
     ensure_schema()
+    sweep_archive_tmp()

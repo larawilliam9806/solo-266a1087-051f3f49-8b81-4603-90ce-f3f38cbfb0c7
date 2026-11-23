@@ -4,7 +4,8 @@
 <h1>批次 {{ batch.batch_no }}</h1>
 <p class="lead">
   {{ batch.note or "登记每卷的摘要（测点数、最薄值、P95、最厚值），或为单卷上传完整读数明细。"
-  }} 判定只使用提交时的同一份档案。
+  }} 判定只使用提交时的同一份档案。停用明细可转存到档案盘腾出测厚库，
+  复核需要时可按留存指纹恢复。
 </p>
 
 <div class="card">
@@ -91,11 +92,25 @@
         <td colspan="6" class="hint">
           卷 {{ v.coil.coil_no }} 停用的明细 #{{ rd.row.id }}（{{ rd.row.point_count }} 个读数，
           最薄 {{ rd.row.min_um }} / P95 {{ rd.row.p95_um }} / 最厚 {{ rd.row.max_um }} μm）：
-          {{ rd.row.retired_reason or "已停用" }}。核算不使用未启用的明细。
+          {{ rd.row.retired_reason or "已停用" }}。
+          {% if rd.row.archived %}
+            <span class="tag">已转存档案盘</span>
+            完整读数在档案盘 detail-{{ rd.row.id }}.json（指纹
+            {{ rd.row.readings_sha256[:12] }}…，{{ rd.row.archived_at }} 登记），
+            库内读数已清除；历史判定照常查阅。
+          {% else %}
+            核算不使用未启用的明细。
+            <form class="inline" method="post"
+                  action="{{ url_for('archive_detail_route', batch_id=batch.id, detail_id=rd.row.id) }}">
+              <button class="secondary" type="submit">转存到档案盘</button>
+            </form>
+          {% endif %}
           {% if rd.matches_summary and not v.detail %}
           <form class="inline" method="post"
                 action="{{ url_for('activate_detail_route', batch_id=batch.id, detail_id=rd.row.id) }}">
-            <button class="secondary" type="submit">按当前摘要启用</button>
+            <button class="secondary" type="submit">
+              {{ "从档案盘恢复并启用" if rd.row.archived else "按当前摘要启用" }}
+            </button>
           </form>
           {% endif %}
         </td>
